@@ -23,6 +23,7 @@ A practical, field-tested reference for diagnosing memory issues on Linux system
 15. [Memory Leak Investigation Workflow](#15-memory-leak-investigation-workflow)
 16. [Tuning Knobs in `/proc/sys/vm/`](#16-tuning-knobs-in-procsysvm)
 17. [Common Scenarios and Fixes](#17-common-scenarios-and-fixes)
+18. [Diagnosing High Load Average](#18-diagnosing-high-load-average)
 
 ---
 
@@ -950,6 +951,311 @@ Don't habitually run `drop_caches` in production. It just makes the next set of 
 ### Scenario H: "OOM killer killed the wrong thing"
 
 **Fix:** Lower `oom_score_adj` for critical processes (sshd, your database) to make them last to be killed. Or set `vm.panic_on_oom=1` if you'd rather reboot than lose the wrong process.
+
+---
+
+## 18. Diagnosing High Load Average
+
+A real-world scenario: you get paged at 3 AM for "load average 150 on a 32-CPU host." That's roughly 4-5x oversubscription. Load alone won't tell you why — and the fix depends entirely on *what* the load is made of. This section is the playbook.
+
+### What load average actually counts
+
+Before running anything, internalize this — it saves you from chasing the wrong thing:
+
+Linux load average counts **runnable processes** (state `R`) **plus uninterruptible sleepers** (state `D`). A load of 150 could mean any of:
+
+- **150 processes fighting for CPU** (true CPU saturation) — kill the hog, problem solved
+- **150 processes blocked on disk I/O** (state D) — CPU could be 95% idle and load still 150
+- **150 processes blocked on a hung NFS mount** — workers stuck in D forever
+- **Some combination** of the above
+
+The fix depends entirely on which. So step one is **categorizing** the load.
+
+### Step 1: 60-second triage
+
+Open a tmux or screen session first — if the box is really sick, your SSH session might be slow and you don't want to lose your work.
+
+```bash
+uptime                          # Confirm the alert; see 1/5/15-min trend
+w                               # Same data plus who's logged in
+top -b -n 1 | head -20          # Snapshot top, batch mode (won't get stuck redrawing)
+vmstat 1 5                      # CPU breakdown + I/O wait + run queue
+```
+
+**The trend in `uptime` matters as much as the absolute number:**
+- `150.2, 142.8, 89.4` — load was 89 fifteen minutes ago and has climbed. Something is *building up*.
+- `150.2, 148.1, 147.9` — pegged and stable. Likely a stuck condition rather than a growing one.
+- `150.2, 22.1, 8.4` — sudden spike just hit. Recent event triggered it.
+
+### Step 2: Categorize the load via vmstat
+
+The columns to watch are `r` (runnable), `b` (blocked on I/O), `us`/`sy` (user/system CPU), and `wa` (I/O wait).
+
+#### Pattern A: CPU-bound load
+
+```
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+142 8   1432  421380 892140 11342108  0    0    24    48 8124 14820 92  6  2  0  0
+148 6   1432  418240 892140 11343224  0    0    16    32 8240 15102 93  5  2  0  0
+```
+
+`r` around 140+, `wa` near 0, `us` at 90%+. Processes are burning CPU. Skip to "CPU hog hunt."
+
+#### Pattern B: I/O-bound load
+
+```
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+  4 142  1432  421380 892140 11342108  0    0  82400 240  3240 4820  8  4 12 76  0
+  3 148  1432  418240 892140 11343224  0    0  74240 180  3120 4640  6  3 18 73  0
+```
+
+`r` is low, `b` is huge, `wa` is 70%+. The 150 is mostly D-state processes. Skip to "I/O wait hunt."
+
+#### Pattern C: Memory pressure causing swap thrashing
+
+```
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 18 22 4892108  92108  18244  448120 2240 2680  6144  7360 9824 14108 22 14 16 48  0
+```
+
+`si`/`so` non-zero, `swpd` large, `wa` high. This is the most painful failure mode because everything is slow. See Section 5 (vmstat) and Section 12 (swap) for memory-specific drill-down.
+
+### Step 3a: CPU hog hunt (when us/sy are high)
+
+```bash
+top -b -n 1 -o %CPU | head -25
+```
+
+Two patterns to recognize:
+
+**One or two giant CPU consumers:**
+
+```
+    PID USER      PR  NI    VIRT    RES  %CPU  %MEM     TIME+ COMMAND
+  18420 app       20   0  4.2g   2.1g   2840   8.4   4842:12 java
+  18421 app       20   0  4.2g   2.1g   2820   8.4   4838:48 java
+```
+
+Two java threads consuming 2800% CPU each — that's 28 cores' worth, each. Likely a runaway garbage collector or an infinite loop. `TIME+` of 4842 minutes = these threads have been burning CPU for ~80 hours. This isn't new; it's just finally caught up to a load alert.
+
+**Thousands of small consumers:**
+
+```bash
+ps -eo state,pid,user,comm --no-headers | awk '$1=="R" {print}' | wc -l
+```
+
+If this returns 200, you don't have one hog — you have a **fork bomb or runaway worker pool**. Find the parent:
+
+```bash
+ps -eo pid,ppid,user,comm | awk '$4=="php-fpm" || $4=="python3"' | sort | uniq -c -f3 | sort -rn | head
+```
+
+Common culprit: a web server (Apache prefork, php-fpm, gunicorn) where the worker count was misconfigured to auto-scale and a traffic spike or downstream slowness caused workers to multiply.
+
+#### Drilling into the suspect process
+
+Once you have a PID:
+
+```bash
+top -H -p <pid>                 # Per-thread view; -H shows individual threads
+ps -L -p <pid>                  # List threads with their states
+cat /proc/<pid>/status | grep -E 'State|Threads|voluntary'
+```
+
+A high `nonvoluntary_ctxt_switches` count growing fast means the thread wants CPU but can't get it because the system is saturated.
+
+For Java specifically:
+
+```bash
+jstack <pid> > /tmp/jstack.out
+grep -A 5 'RUNNABLE' /tmp/jstack.out | head -60
+```
+
+Look for threads stuck in tight loops — same code line across multiple `jstack` snapshots = infinite loop.
+
+For Python:
+
+```bash
+py-spy dump --pid <pid>         # If py-spy is installed
+# Otherwise:
+gdb -p <pid> -batch -ex "py-bt" -ex quit 2>/dev/null
+```
+
+### Step 3b: I/O wait hunt (when wa is high and b is high)
+
+This is where most "mysterious" high load comes from. The CPU sits idle while 150 processes are stuck in `D` state waiting on something.
+
+#### List all D-state processes
+
+```bash
+ps -eo state,pid,user,wchan:30,comm --no-headers | awk '$1=="D"' | head -40
+```
+
+**The `wchan` column is gold.** It shows the kernel function the process is sleeping in. Patterns:
+
+```
+D 18420 app  io_schedule                  mysqld
+D 18421 app  io_schedule                  mysqld
+D 18422 app  io_schedule                  mysqld
+```
+
+`io_schedule` = waiting on block I/O. Disk is the bottleneck. Check `iostat`.
+
+```
+D 22104 root nfs_wait_on_request          rsync
+D 22105 root nfs_wait_on_request          rsync
+```
+
+`nfs_*` = stuck NFS mount. **Classic cause of mass D-state.** A single hung NFS server can lock up dozens of processes that touched the mount.
+
+```
+D 18420 app  futex_wait_queue_me          postgres
+D 18421 app  futex_wait_queue_me          postgres
+```
+
+`futex_*` = userspace lock contention (not strictly I/O wait, but counted in load). Many DB connections fighting over a lock.
+
+#### When it's disk I/O
+
+```bash
+iostat -xz 2 5
+```
+
+Watch for:
+
+```
+Device  r/s  w/s  rkB/s  wkB/s  await  r_await  w_await  %util
+sda    0.20 4280 0.80  68480  482.40  120.00   482.40  100.00
+```
+
+`%util 100.00` and `await 482ms` — the disk is saturated and each request waits half a second. Find who's hammering it:
+
+```bash
+iotop -boP -n 3 -d 2            # Batch mode, processes only
+# Or, without iotop, lifetime totals from /proc/<pid>/io:
+for pid in $(ps -eo pid --no-headers); do
+    io=$(cat /proc/$pid/io 2>/dev/null | awk '/^write_bytes/ {print $2}')
+    if [ -n "$io" ] && [ "$io" -gt 100000000 ]; then
+        echo "$io  $(ps -p $pid -o comm= 2>/dev/null) (PID $pid)"
+    fi
+done | sort -rn | head
+```
+
+`/proc/<pid>/io` shows **lifetime** I/O totals — useful to spot a process that's been writing terabytes since it started, even if its current rate looks modest.
+
+#### When it's NFS
+
+```bash
+mount | grep nfs
+nfsstat -c                      # Client-side NFS stats
+# Test each mount for hang:
+for m in $(mount | grep nfs | awk '{print $3}'); do
+    timeout 5 ls "$m" >/dev/null 2>&1 && echo "$m OK" || echo "$m HUNG"
+done
+```
+
+A hung mount needs the NFS server fixed, or a forced unmount (`umount -f -l`). Until then, every process that touches the mount goes into D state and stays there — and **you cannot kill a D-state process**. Not even with `kill -9`. The kernel is waiting on something that will never return.
+
+This is often *the* answer to "why is load 150 but CPU is 0%."
+
+### Step 4: Check the kernel side
+
+Non-obvious causes that often get missed:
+
+#### Kernel softirq storms
+
+```bash
+cat /proc/softirqs        # Look for one CPU with massively higher counts than others
+mpstat -P ALL 2 3         # Per-CPU breakdown; watch %soft column
+```
+
+If one CPU shows `%soft` of 80%+ while others are idle, network interrupts are pinned to a single CPU. Common on boxes with single-queue NICs under heavy traffic. Fix: enable RPS/RSS or use `irqbalance`.
+
+#### Stuck kernel threads
+
+```bash
+ps -eo state,pid,comm | awk '$1=="D" && $3 ~ /^\[/'
+```
+
+Square brackets around the name = kernel thread. A D-state kernel thread (e.g. `[kworker/...]`, `[jbd2/sda1-8]`) stuck for minutes is a sign of a kernel/driver bug or a stuck device. Check `dmesg` for `task X blocked for more than 120 seconds` messages — these are the kernel's hung-task detector firing.
+
+#### Hung-task detector output
+
+```bash
+dmesg -T | grep -A 10 'blocked for more than'
+```
+
+Sample output:
+
+```
+[Tue May 19 09:42:18] INFO: task mysqld:18420 blocked for more than 120 seconds.
+[Tue May 19 09:42:18]       Not tainted 6.5.0-21-generic #21-Ubuntu
+[Tue May 19 09:42:18] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[Tue May 19 09:42:18] task:mysqld    state:D stack:0     pid:18420 ppid:1234
+[Tue May 19 09:42:18] Call Trace:
+[Tue May 19 09:42:18]  __schedule+0x2cd/0x8b0
+[Tue May 19 09:42:18]  schedule+0x5b/0xd0
+[Tue May 19 09:42:18]  io_schedule+0x46/0x80
+[Tue May 19 09:42:18]  folio_wait_bit_common+0x13d/0x340
+```
+
+The stack trace tells you exactly what kernel path is stuck. `folio_wait_bit_common` + `io_schedule` = waiting on a page write to disk. If you see many of these for the same device, that device is the problem.
+
+### Step 5: Decide and act
+
+By now you should be able to answer:
+
+1. **Is load CPU-driven or D-state-driven?** (vmstat columns)
+2. **If CPU: one hog or many small ones?** (top sort)
+3. **If D-state: what are they waiting on?** (wchan)
+4. **Is memory adequate?** (free, vmstat si/so)
+5. **Is the kernel itself stuck?** (dmesg hung-task warnings)
+
+The fix depends on the answer:
+
+- **Single CPU hog** — restart it (after capturing a thread dump if it's worth a postmortem)
+- **Worker explosion** — cap worker count in config, restart the parent
+- **Disk saturation** — throttle the offender (`ionice -c 3 -p <pid>`), or move workload, or add I/O capacity
+- **Hung NFS** — fix the NFS server; lazy-unmount the client mount if needed
+- **Memory thrashing** — kill the hog, add RAM, or fix the leak (see Sections 13, 15)
+- **Stuck kernel/driver** — reboot is often the only fix; capture `dmesg`, `/proc/<pid>/stack` for the stuck PIDs, and a `sysrq-t` if you can, then schedule the reboot
+
+### Step 6: Capture forensics before you fix
+
+If you can spare 30 seconds before remediating, grab evidence — once you restart the service, the cause vanishes:
+
+```bash
+mkdir -p /tmp/triage-$(date +%s) && cd /tmp/triage-*
+uptime > uptime.txt
+ps auxf > ps-tree.txt
+ps -eo state,pid,ppid,user,wchan:30,pcpu,pmem,etime,comm --sort=-pcpu > ps-detail.txt
+top -b -n 1 > top.txt
+vmstat 1 10 > vmstat.txt &
+iostat -xz 2 5 > iostat.txt &
+mpstat -P ALL 2 5 > mpstat.txt &
+wait
+cat /proc/loadavg > loadavg.txt
+dmesg -T > dmesg.txt
+cp /proc/meminfo meminfo.txt
+ss -s > sockets.txt
+# For any suspect PIDs:
+for pid in <suspect_pids>; do
+    cat /proc/$pid/status > pid-$pid-status.txt
+    cat /proc/$pid/stack > pid-$pid-stack.txt 2>/dev/null
+    cat /proc/$pid/wchan > pid-$pid-wchan.txt 2>/dev/null
+done
+tar czf /tmp/triage-$(hostname)-$(date +%s).tar.gz .
+```
+
+`/proc/<pid>/stack` shows the *current kernel call stack* for that process — invaluable for understanding why a D-state process is stuck. Most people don't know it exists.
+
+### The most important thing to remember
+
+**Load average of 150 sounds catastrophic, but the box might be fine.** A box with load 200 can happily serve traffic if most of the load is D-state processes waiting on a deliberately slow batch job. A box with load 8 can be completely unresponsive if all 8 are burning kernel CPU in a softirq loop.
+
+**Don't react to the number. React to what the users are seeing.** Is the application slow? Are requests timing out? If yes, dig in fast. If everything's actually responding fine, load 150 might just mean "I have a lot of patient sleepers" — find out *why*, fix anything actionable, but don't reboot a working box because a graph looks bad.
 
 ---
 
