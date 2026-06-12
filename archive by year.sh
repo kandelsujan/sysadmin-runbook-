@@ -53,6 +53,7 @@ ARCHIVE_LOG_FILE="${LOG_DIRECTORY}/${LOG_FILE}"
 # time, so dry runs and aborted instances leave nothing behind.
 RSYNC_ERR_FILE="${LOG_DIRECTORY}/RSYNC_ERR.${RUN_ID}"
 FAILED_FILES_LIST="${LOG_DIRECTORY}/FAILED_FILES_LIST_${ARCHIVE_YEAR}"
+FAILED_DELETES_LIST="${LOG_DIRECTORY}/FAILED_DELETES_${ARCHIVE_YEAR}"
 LOCK_FILE="${LOG_DIRECTORY}/archive.LCK"
 PRIOR_YEAR_ARCHIVE=$((ARCHIVE_YEAR - 1))
 
@@ -262,70 +263,50 @@ retry_failed_files() {
         return 1
 }
 
-# Prune empty directories left behind by this run's deletions — and ONLY
-# those. Directory paths are derived from the manifest itself (every parent
-# of every deleted file), sorted deepest-first, and removed with rmdir.
-# rmdir refuses to remove a non-empty directory, so anything still holding
-# files from other years — or pre-existing empty dirs elsewhere on the
-# share — is never touched.
-prune_emptied_directories() {
-        local pruned=0
-        local dir
-
-        # Build the unique set of ancestor directories of every manifest
-        # entry, then order deepest path first so children are attempted
-        # before their parents (letting a whole emptied branch collapse).
-        while IFS= read -r dir; do
-                [[ -z "${dir}" ]] && continue
-                if rmdir -- "${SOURCE_SHARE}/${dir}" 2>/dev/null; then
-                        log "INFO" "Removed emptied directory ${SOURCE_SHARE}/${dir}"
-                        ((pruned++)) || true
-                fi
-        done < <(
-                while IFS= read -r rel_path; do
-                        [[ -z "${rel_path}" ]] && continue
-                        local d
-                        d=$(dirname "${rel_path}")
-                        while [[ "${d}" != "." && "${d}" != "/" ]]; do
-                                echo "${d}"
-                                d=$(dirname "${d}")
-                        done
-                done <"${ARCHIVE_MANIFEST}" |
-                        sort -u |
-                        awk '{ print length($0), $0 }' |
-                        sort -rn |
-                        cut -d' ' -f2-
-        )
-
-        log "INFO" "Pruned ${pruned} directory(ies) emptied by this archive run"
-}
-
 # Delete the source copies of every file in the manifest. Only ever called
 # after validation fully passed AND DELETE_SOURCE=true, so every file in the
 # manifest is known to exist at the destination with a matching checksum.
-# Failures are logged and counted rather than aborting mid-delete.
+#
+# Deletion is batched with xargs (thousands of files per rm invocation)
+# rather than one rm per file — essential over NFS at large file counts.
+# Because batching loses per-file error reporting, we verify afterward:
+# any manifest entry still present on disk is recorded in
+# FAILED_DELETES_LIST (separate from FAILED_FILES_LIST, which tracks
+# checksum failures — different problem, different remediation).
+#
+# NOTE: empty directories are intentionally left behind (decided 2026-06).
+# They cost nothing; clean up manually if ever needed:
+#   find "${SOURCE_SHARE}" -mindepth 1 -type d -empty -delete
 delete_source_files() {
         local file_count
         file_count=$(count_manifest_files "${ARCHIVE_MANIFEST}")
         log "INFO" "Validation passed and DELETE_SOURCE=true. Deleting ${file_count} source file(s) from ${SOURCE_SHARE}"
 
-        local failed_deletes=0
-        local rel_path
-        while IFS= read -r rel_path; do
-                [[ -z "${rel_path}" ]] && continue
-                if ! rm -f -- "${SOURCE_SHARE}/${rel_path}"; then
-                        log "ERROR" "Failed to delete ${SOURCE_SHARE}/${rel_path}"
-                        ((failed_deletes++)) || true
-                fi
-        done <"${ARCHIVE_MANIFEST}"
+        # Batched delete, run from inside SOURCE_SHARE so the manifest's
+        # relative paths resolve directly. '|| true' because rm exits
+        # non-zero if any file was already gone; we detect real survivors
+        # ourselves below instead of dying under set -e.
+        (cd "${SOURCE_SHARE}" && xargs -d '\n' -r rm -f -- ) <"${ARCHIVE_MANIFEST}" || true
+
+        # Post-verification, batched like the delete itself:
+        #   - 'ls -d' via xargs prints only the manifest paths that still
+        #     exist (survivors); errors for the deleted ones are discarded.
+        #   - 'comm -12' intersects the sorted manifest with the sorted
+        #     survivors, writing real failed deletes to FAILED_DELETES_LIST.
+        comm -12 \
+                <(sort "${ARCHIVE_MANIFEST}") \
+                <(cd "${SOURCE_SHARE}" && sort "${ARCHIVE_MANIFEST}" | xargs -d '\n' -r ls -d -- 2>/dev/null | sort) \
+                >"${FAILED_DELETES_LIST}"
+
+        local failed_deletes
+        failed_deletes=$(wc -l <"${FAILED_DELETES_LIST}")
 
         if [[ "${failed_deletes}" -eq 0 ]]; then
+                rm -f "${FAILED_DELETES_LIST}"
                 log "INFO" "All ${file_count} source file(s) deleted successfully"
-                # Clean up any directories that this run emptied out
-                prune_emptied_directories
                 return 0
         else
-                log "ERROR" "${failed_deletes} file(s) could not be deleted from the source share. Manual intervention required."
+                log "ERROR" "${failed_deletes} file(s) could not be deleted from the source share. Manual intervention required. See ${FAILED_DELETES_LIST}"
                 return 1
         fi
 }
@@ -411,8 +392,8 @@ fi
 verify_nfs_shares
 verify_write_permissions
 
-# Clear any stale failure list from a previously crashed run
-rm -f "${FAILED_FILES_LIST}"
+# Clear any stale failure lists from a previously crashed run
+rm -f "${FAILED_FILES_LIST}" "${FAILED_DELETES_LIST}"
 
 # Step 1: Find the files and write them to a manifest file
 log "INFO" "Finding files on ${SOURCE_SHARE} last modified in ${ARCHIVE_YEAR}"
