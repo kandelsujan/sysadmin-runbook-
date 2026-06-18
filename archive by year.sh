@@ -505,6 +505,29 @@ verify_write_permissions() {
         fi
 }
 
+# Check that both shares actually exist as directories before anything else
+# touches them. This MUST run before verify_nfs_shares and
+# verify_write_permissions, because those call stat/touch on the paths — if a
+# path is a typo or an unmounted mountpoint, we want a clear "doesn't exist"
+# message here rather than a confusing stat error or, worse, silent work
+# against the wrong location.
+#
+# '-d' tests "exists AND is a directory", which also rejects the case where
+# the path exists but is a plain file.
+verify_shares_exist() {
+        if [[ ! -d "${SOURCE_SHARE}" ]]; then
+                log "FATAL" "Source Share ${SOURCE_SHARE} does not exist or is not a directory. EXITING..."
+                return 1
+        fi
+        log "INFO" "Source Share ${SOURCE_SHARE} exists"
+
+        if [[ ! -d "${DESTINATION_SHARE}" ]]; then
+                log "FATAL" "Destination Share ${DESTINATION_SHARE} does not exist or is not a directory. EXITING..."
+                return 1
+        fi
+        log "INFO" "Destination Share ${DESTINATION_SHARE} exists"
+}
+
 # Check if source and destination shares are both NFS. If they are not NFS
 # shares, exit the script.
 #
@@ -577,8 +600,11 @@ if [[ "${DRY_RUN}" == true && "${DELETE_SOURCE}" == true ]]; then
         exit 1
 fi
 
-# Pre-flight checks: source and destination must be NFS, and the script must
-# have write permissions to both of them
+# Pre-flight checks, in order: the shares must exist, must both be NFS mounts,
+# and the script must have write permission to both. Each exits the run on
+# failure, so order matters — existence is verified before anything stats or
+# writes to the paths.
+verify_shares_exist
 verify_nfs_shares
 verify_write_permissions
 
