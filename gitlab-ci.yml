@@ -1,0 +1,165 @@
+---
+# Pipeline for the OpenVox control repo.
+#
+# Gate order matters: cheap syntax checks fail in seconds, catalog diff runs
+# only on merge requests, and deploy only ever runs on protected branches.
+
+stages:
+  - validate
+  - unit
+  - diff
+  - deploy
+
+default:
+  image: ghcr.io/voxpupuli/voxbox:8
+  tags: ['linux']
+  cache:
+    key: "$CI_COMMIT_REF_SLUG"
+    paths: ['vendor/bundle']
+
+variables:
+  BUNDLE_PATH: vendor/bundle
+  GIT_DEPTH: '0'   # octocatalog-diff needs full history
+
+# -----------------------------------------------------------------------------
+# validate: seconds, catches most of what actually breaks production
+# -----------------------------------------------------------------------------
+puppet:syntax:
+  stage: validate
+  script:
+    - puppet parser validate manifests/ site-modules/
+    - puppet-lint site-modules/
+
+data:syntax:
+  stage: validate
+  script:
+    - yamllint -s data/ hiera.yaml .gitlab-ci.yml
+    # Catches the classic failure: a key under data/role/ that no class accepts.
+    # Silent in Puppet, invisible until someone wonders why the value never applied.
+    - ./scripts/check-hiera-keys.rb
+
+puppetfile:
+  stage: validate
+  script:
+    - r10k puppetfile check
+    # An unpinned mod means two compilers can resolve different code for the
+    # same environment. Refuse the merge.
+    - ./scripts/check-puppetfile-pins.rb
+
+# -----------------------------------------------------------------------------
+# unit: rspec-puppet compiles every role against representative facts
+# -----------------------------------------------------------------------------
+rspec:
+  stage: unit
+  script:
+    - bundle install --jobs 4
+    - bundle exec rake spec
+  artifacts:
+    reports:
+      junit: junit.xml
+    when: always
+
+# -----------------------------------------------------------------------------
+# diff: the single highest-value gate. Shows the reviewer the resources that
+# will actually change on real nodes, not just that the code parses.
+# -----------------------------------------------------------------------------
+catalog:diff:
+  stage: diff
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+  script:
+    - bundle install --jobs 4
+    - |
+      # Diff against the branch this MR targets (reg, imp or vip), not a fixed
+      # 'production'. An MR into vip is compared to vip's current state.
+      for node in $(cat spec/diff_nodes.txt); do
+        bundle exec octocatalog-diff \
+          --from "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" \
+          --to "$CI_COMMIT_REF_NAME" \
+          --hiera-config hiera.yaml \
+          --output-file "diff-${node}.txt" \
+          "$node" || true
+      done
+  artifacts:
+    paths: ['diff-*.txt']
+    expire_in: 1 week
+  allow_failure: true
+
+# -----------------------------------------------------------------------------
+# reference: sanity-check that the allowlist still resolves against real
+# parameters. App teams generate this themselves from a clone; publishing it as
+# an artifact is no longer necessary now they have read access.
+# -----------------------------------------------------------------------------
+reference:
+  stage: validate
+  script:
+    - ./scripts/generate-param-reference.rb
+
+# -----------------------------------------------------------------------------
+# deploy: only from protected branches, serialised, all compilers or none
+# -----------------------------------------------------------------------------
+.deploy:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$R10K_DEPLOY_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - echo "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+  script:
+    # The remote key is locked to a forced command, so this argument is the
+    # only thing the CI key can influence.
+    - ssh puppet-deploy@"$COMPILER" "$CI_ENVIRONMENT_NAME"
+
+# Deployable branches:
+#   production        -- the platform itself (compilers, CA, db, LBs)
+#   reg | imp | vip   -- criticality tiers, each its own standing environment.
+#                        Hosts are pinned to a tier at build and never move.
+# Rollout model: module changes are validated on reg first (reg's Puppetfile may
+# pin -rc tags), then imp and vip pin the FINAL tag via their own MRs once the
+# module's main branch has the change. See docs/ROLLOUT.md.
+deploy:environment:
+  extends: .deploy
+  resource_group: "$CI_COMMIT_BRANCH"   # serialise per environment; different environments deploy in parallel
+  environment:
+    name: "$CI_COMMIT_BRANCH"
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^(production|reg|imp|vip)$/
+  parallel:
+    matrix:
+      - COMPILER:
+          - vox1.example.com
+          - vox2.example.com
+          - vox3.example.com
+
+
+# Feature branches deploy to a single test compiler that is not in the HAProxy
+# pool. With environment_timeout=unlimited, letting every MR branch land on
+# production compilers multiplies both disk and JRuby heap.
+deploy:branch:
+  extends: .deploy
+  variables:
+    COMPILER: voxtest1.example.com
+  environment:
+    name: "$CI_COMMIT_REF_SLUG"
+    on_stop: undeploy:branch
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      when: manual
+      allow_failure: true
+
+undeploy:branch:
+  extends: .deploy
+  variables:
+    COMPILER: voxtest1.example.com
+    GIT_STRATEGY: none
+  environment:
+    name: "$CI_COMMIT_REF_SLUG"
+    action: stop
+  script:
+    - ssh puppet-deploy@"$COMPILER" "--purge $CI_ENVIRONMENT_NAME"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      when: manual
+      allow_failure: true
