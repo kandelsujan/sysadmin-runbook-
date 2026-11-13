@@ -1,0 +1,498 @@
+---
+# PHP2Shell (CVE-2026-109618 / CVE-2026-109619) audit. Read-only: changes nothing on targets
+# and never executes the PHP binaries it finds (versions are read from the files).
+#
+#   ansible-playbook -i inventory php2shell_check.yml
+#   ansible-playbook -i inventory php2shell_check.yml -e fail_on_vulnerable=false
+#
+# Covers PHP from OS packages, third-party repos, and builds installed without a package
+# manager (found on disk under php_search_paths, or through running processes).
+#
+# Evidence, in order. The first that holds decides:
+#   1. upstream version >= 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 for its branch  -> FIXED
+#   2. version below 5.4.0 (outside the reported affected range)             -> NOT_AFFECTED
+#   3. package version >= a vendor fixed build listed in fixed_builds        -> FIXED
+#   4. package changelog names one of the CVEs                               -> FIXED
+#   5. unpackaged binary: path listed in attested_patched_paths              -> FIXED
+#   6. unpackaged binary: contains the fix's memory_hard_limit_percent
+#      setting (seen in 8.2+ patched builds; a strong hint, not proof)       -> FIXED
+# Otherwise VULNERABLE, or UNVERIFIED where a backport cannot be ruled in or out
+# (third-party packages with no fixed_builds row, source builds of old branches).
+# Results land in ./php2shell_report.csv.
+
+- name: Check Linux hosts for PHP2Shell
+  hosts: all
+  become: true
+  gather_facts: true
+  gather_subset:
+    - "!all"
+    - min
+  vars:
+    fail_on_vulnerable: true
+    report_file: "{{ playbook_dir }}/php2shell_report.csv"
+    cve_re: 'CVE-2026-10961[89]'
+    version_re: '[0-9]+[.][0-9]+[.][0-9]+'
+    first_affected: '5.4.0'
+    fixed_releases:
+      "8.2": "8.2.35"
+      "8.3": "8.3.36"
+      "8.4": "8.4.27"
+      "8.5": "8.5.12"
+
+    # Vendor backports that keep the old upstream version number.
+    #   os:     list of "Ubuntu-<version>" / "RedHat-<major>" (RHEL, Rocky, CentOS), or "any"
+    #   branch: PHP major.minor
+    #   fixed:  first fixed build; deb version, or rpm version-release prefix
+    #   vendor: optional regex on "<package> <version-release>". With it, the row applies
+    #           only to matching packages. Without it, the row applies to every package
+    #           that does not look third-party (see third_party_re).
+    # A package passes if it meets ANY row that applies to it. Add rows for your own
+    # sources (TuxCare ELS, CloudLinux, internal rebuilds) with their fixed build numbers.
+    fixed_builds:
+      # Ubuntu (18.04 and 20.04 need Ubuntu Pro ESM)
+      - { os: ['Ubuntu-18.04'], branch: '7.2', fixed: '7.2.24-0ubuntu0.18.04.17+esm14' }
+      - { os: ['Ubuntu-20.04'], branch: '7.4', fixed: '7.4.3-4ubuntu2.29+esm5' }
+      - { os: ['Ubuntu-22.04'], branch: '8.1', fixed: '8.1.2-1ubuntu2.28' }
+      - { os: ['Ubuntu-24.04'], branch: '8.3', fixed: '8.3.6-0ubuntu0.24.04.13' }
+      # Red Hat / Rocky AppStream
+      - { os: ['RedHat-8'], branch: '7.4', fixed: '7.4.33-8' }
+      - { os: ['RedHat-9'], branch: '8.0', fixed: '8.0.30-8.el9_8.1' }
+      # Remi (EL8 and EL9 only; Remi publishes nothing for EL7)
+      - { os: ['RedHat-8'], branch: '7.2', fixed: '7.2.34-31', vendor: 'remi' }
+      - { os: ['RedHat-8'], branch: '7.3', fixed: '7.3.33-24', vendor: 'remi' }
+      - { os: ['RedHat-8', 'RedHat-9'], branch: '7.4', fixed: '7.4.33-31', vendor: 'remi' }
+      - { os: ['RedHat-8', 'RedHat-9'], branch: '8.0', fixed: '8.0.30-21', vendor: 'remi' }
+      - { os: ['RedHat-8', 'RedHat-9'], branch: '8.1', fixed: '8.1.34-6', vendor: 'remi' }
+      # GetPageSpeed drop-ins for CentOS/RHEL 7 and old branches on EL8
+      - { os: ['RedHat-7'], branch: '5.4', fixed: '5.4.45-20' }
+      - { os: ['RedHat-7'], branch: '5.6', fixed: '5.6.40-44' }
+      - { os: ['RedHat-7'], branch: '7.0', fixed: '7.0.33-46' }
+      - { os: ['RedHat-7'], branch: '7.1', fixed: '7.1.33-35' }
+      - { os: ['RedHat-7'], branch: '7.2', fixed: '7.2.34-30' }
+      - { os: ['RedHat-7'], branch: '7.3', fixed: '7.3.33-26' }
+      - { os: ['RedHat-7'], branch: '7.4', fixed: '7.4.33-35' }
+      - { os: ['RedHat-7'], branch: '8.1', fixed: '8.1.34-8' }
+      - { os: ['RedHat-8'], branch: '5.6', fixed: '5.6.40-50' }
+      - { os: ['RedHat-8'], branch: '7.0', fixed: '7.0.33-52' }
+      - { os: ['RedHat-8'], branch: '7.1', fixed: '7.1.33-42' }
+      # Unofficial community rebuild of the stock EL7 package
+      - { os: ['RedHat-7'], branch: '5.4', fixed: '5.4.16-48.el7.php2shell.1', vendor: 'php2shell' }
+      # Sury / ondrej PPA
+      - { os: ['any'], branch: '5.6', fixed: '5.6.40-105', vendor: 'sury' }
+      - { os: ['any'], branch: '7.0', fixed: '7.0.33-93', vendor: 'sury' }
+      - { os: ['any'], branch: '7.1', fixed: '7.1.33-81', vendor: 'sury' }
+      - { os: ['any'], branch: '7.2', fixed: '7.2.34-66', vendor: 'sury' }
+      - { os: ['any'], branch: '7.3', fixed: '7.3.33-35', vendor: 'sury' }
+      # Example for an extended-support vendor (fill in the build from their advisory):
+      # - { os: ['RedHat-7'], branch: '5.4', fixed: '5.4.16-48.el7.tuxcare.els1', vendor: 'tuxcare' }
+    third_party_re: 'remi|sury|[.]ius|ea-php|alt-php|plesk|tuxcare|cloudlinux'
+
+    # OS, Remi (php83-php-common), SCL (rh-php73-php-common), IUS (php74-common),
+    # cPanel (ea-php81-php-common), CloudLinux (alt-php74), Ubuntu (php8.3-common)
+    php_pkg_re: '^((rh-|ea-|alt-)?php[0-9.]*u?(-php)?(-(common|cli|fpm|cgi))?|libapache2-mod-php[0-9.]+|mod_php)$'
+
+    # Where to look for PHP binaries and Apache modules on disk. Searched recursively.
+    # Add any other prefix you build into (for example /home, /srv, /data).
+    php_search_paths:
+      - /usr/bin
+      - /usr/sbin
+      - /usr/local
+      - /opt
+      - /usr/lib/apache2/modules
+      - /usr/lib64/httpd/modules
+      - /usr/lib/httpd/modules
+    php_file_re: '^(php|php-fpm|php-cgi|lsphp)[0-9.]*$|^php[0-9.]+-(fpm|cgi)$|^libphp[0-9.]*[.]so$'
+
+    # Regexes for paths of source builds you have confirmed are patched, e.g. '^/opt/php-5[.]6-patched/'
+    attested_patched_paths: []
+
+    web_proc_re: 'php-fpm|php-cgi|lsphp|frankenphp|apache2|httpd'
+
+  tasks:
+    # ---------- packaged PHP ----------
+    # Asks the OS package manager (rpm or dpkg, picked automatically) for everything installed
+    # and stores it in ansible_facts.packages as { name: [ {version, release, ...}, ... ] }.
+    # A name can have several entries when more than one build is installed side by side.
+    # Needs python3-apt on Ubuntu and the rpm Python bindings on EL (both normally present).
+    - name: Gather installed packages
+      ansible.builtin.package_facts:
+        manager: auto
+
+    # Pure Jinja, nothing runs on the target. Builds php2shell_pkgs, one entry per PHP package:
+    #   1. Keep packages whose name matches php_pkg_re and whose version contains x.y.z
+    #      (this drops metapackages such as Ubuntu's "php" 2:8.3+93).
+    #   2. by_version: true when x.y.z is at or above the fixed upstream release for its
+    #      branch (fixed_releases), or the branch is newer than 8.5.
+    #   3. below_range: true when x.y.z is older than first_affected (5.4.0).
+    #   4. third_party: true when "<name> <version-release>" matches third_party_re.
+    #   5. targets: the fixed_builds rows that apply. A row applies when its OS list contains
+    #      this host's key (php2shell_os, e.g. Ubuntu-22.04 or RedHat-8) or "any", its branch
+    #      matches, and either its vendor regex matches the package or it has no vendor and
+    #      the package is not third-party.
+    #   6. rpm_hit (EL only): the first target this package meets. Upstream version is
+    #      compared first; if equal, the leading number of the release (the "8" in
+    #      8.el9_8.1), then the whole release string as a loose version compare.
+    #      Deb packages are compared by dpkg in the next task instead, so rpm_hit stays empty.
+    - name: Select PHP packages and compare with fixed upstream and vendor builds
+      vars:
+        php2shell_os: >-
+          {{ 'Ubuntu-' ~ ansible_facts.distribution_version if ansible_facts.distribution == 'Ubuntu'
+             else ansible_facts.os_family ~ '-' ~ ansible_facts.distribution_major_version }}
+      ansible.builtin.set_fact:
+        php2shell_pkgs: >-
+          {%- set out = [] -%}
+          {%- for name, insts in ansible_facts.packages.items() if name is match(php_pkg_re) -%}
+          {%- for i in insts -%}
+          {%- set up = i.version | regex_search(version_re) -%}
+          {%- if up -%}
+          {%- set branch = up.split('.')[:2] | join('.') -%}
+          {%- set ok = (branch in fixed_releases and up is version(fixed_releases[branch], '>='))
+                       or up is version('8.6.0', '>=') -%}
+          {%- set rel = i.release | default('', true) -%}
+          {%- set full = i.version ~ ('-' ~ rel if rel else '') -%}
+          {%- set ident = name ~ ' ' ~ full -%}
+          {%- set tp = ident is search(third_party_re) -%}
+          {%- set targets = [] -%}
+          {%- for row in fixed_builds
+              if row.branch == branch and (php2shell_os in row.os or 'any' in row.os) -%}
+          {%- if (row.vendor is defined and ident is search(row.vendor))
+                 or (row.vendor is not defined and not tp) -%}
+          {%- set _ = targets.append(row.fixed) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- set hit = [] -%}
+          {%- if ansible_facts.os_family != 'Debian' -%}
+          {%- for t in targets -%}
+          {%- set fv = t.split('-')[0] -%}
+          {%- set fr = t.split('-')[1] | default('0') -%}
+          {%- set ri = rel | regex_search('^[0-9]+') | default('0', true) | int -%}
+          {%- set fi = fr | regex_search('^[0-9]+') | default('0', true) | int -%}
+          {%- if i.version is version(fv, '>')
+                 or (i.version == fv and (ri > fi or (ri == fi and (rel == fr or rel is version(fr, '>='))))) -%}
+          {%- set _ = hit.append(t) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- endif -%}
+          {%- set _ = out.append({'name': name, 'version': full, 'upstream': up, 'by_version': ok,
+                                  'below_range': up is version(first_affected, '<'),
+                                  'third_party': tp, 'targets': targets,
+                                  'rpm_hit': hit | first | default('')}) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+
+    # Debian/Ubuntu only (the loop is empty elsewhere). For every package not already fixed by
+    # upstream version, and every target row from the previous task, runs
+    #   dpkg --compare-versions <installed> ge <fixed>
+    # which applies real Debian ordering (epochs, ~, +esm suffixes). rc 0 means the installed
+    # version is at or above the fixed build, rc 1 means older; anything else is an error.
+    # subelements('targets') yields (package, target) pairs: item.0 is the package, item.1 the target.
+    - name: Compare deb versions with vendor fixed builds
+      ansible.builtin.command:
+        argv: ['dpkg', '--compare-versions', "{{ item.0.version }}", 'ge', "{{ item.1 }}"]
+      loop: >-
+        {{ php2shell_pkgs | rejectattr('by_version') | list | subelements('targets')
+           if ansible_facts.os_family == 'Debian' else [] }}
+      loop_control:
+        label: "{{ item.0.name }} {{ item.0.version }} >= {{ item.1 }}"
+      register: php2shell_debcmp
+      changed_when: false
+      failed_when: php2shell_debcmp.rc > 1
+      check_mode: false
+
+    # Fallback evidence for backports not listed in fixed_builds. For each package that is
+    # neither fixed by upstream version nor below the affected range:
+    #   Debian/Ubuntu: zgrep the CVE regex in /usr/share/doc/<pkg>/changelog.Debian.gz
+    #   EL:            rpm -q --changelog <pkg>   (whole changelog; searched later in Jinja)
+    # Errors are ignored (failed_when: false): a missing changelog simply counts as "no match".
+    # A match upgrades the package to FIXED; no match proves nothing by itself.
+    - name: Look for the CVE IDs in package changelogs
+      ansible.builtin.command:
+        argv: >-
+          {{ ['zgrep', '-E', cve_re, '/usr/share/doc/' ~ item.name ~ '/changelog.Debian.gz']
+             if ansible_facts.os_family == 'Debian'
+             else ['rpm', '-q', '--changelog', item.name] }}
+      loop: "{{ php2shell_pkgs | rejectattr('by_version') | rejectattr('below_range') | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: php2shell_changelog
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    # ---------- running processes ----------
+    # pgrep -P 1 -l lists "<pid> <name>" for processes whose parent is PID 1 and whose name
+    # matches web_proc_re. Limiting to children of init returns the master/daemon processes
+    # (php-fpm master, apache2/httpd parent) instead of hundreds of workers.
+    # rc 1 just means nothing matched, so only rc > 1 is treated as a failure.
+    # Used for three things: the web_sapi column, the restart check, and finding PHP binaries
+    # that are in use but live outside php_search_paths.
+    - name: List running web server and PHP master processes
+      ansible.builtin.command:
+        argv: ['pgrep', '-P', '1', '-l', "{{ web_proc_re }}"]
+      register: php2shell_procs
+      changed_when: false
+      failed_when: php2shell_procs.rc > 1
+      check_mode: false
+
+    # Greps /proc/<pid>/maps (the files each process has mapped into memory) for two things:
+    #   libphp...             Apache has mod_php loaded, so Apache itself is the PHP SAPI
+    #   php... (deleted)      the process still maps a PHP file that was replaced on disk,
+    #                         i.e. it was started before the package was updated
+    # The second case is what turns a host into RESTART_NEEDED. Processes that exit between
+    # the two tasks make grep fail, which is ignored.
+    - name: Inspect those processes for mod_php and pre-update PHP binaries
+      ansible.builtin.command:
+        argv: ['grep', '-E', 'libphp|php.*[(]deleted[)]', "/proc/{{ item.split()[0] }}/maps"]
+      loop: "{{ php2shell_procs.stdout_lines }}"
+      register: php2shell_maps
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    # readlink /proc/<pid>/exe gives the real path of the executable for each non-Apache
+    # process found above (php-fpm, php-cgi, lsphp, frankenphp). This catches PHP installed
+    # anywhere on the filesystem, as long as it is running.
+    - name: Resolve the binary behind each running PHP process
+      ansible.builtin.command:
+        argv: ['readlink', "/proc/{{ item.split()[0] }}/exe"]
+      loop: "{{ php2shell_procs.stdout_lines | reject('search', 'apache2|httpd') | list }}"
+      register: php2shell_exes
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    # ---------- PHP installed without the package manager ----------
+    # Recursive search of php_search_paths for regular files whose NAME matches php_file_re:
+    # php, php8.3, php-fpm, php-fpm7.4, php7.4-fpm, php-cgi, lsphp, libphp*.so.
+    # Symlinks are skipped (file_type: file), so /usr/bin/php -> php8.3 is counted once.
+    # Missing directories only produce a warning. /opt can be large; trim or extend
+    # php_search_paths to match where you install software.
+    - name: Find PHP binaries and Apache modules on disk
+      ansible.builtin.find:
+        paths: "{{ php_search_paths }}"
+        patterns: "{{ php_file_re }}"
+        use_regex: true
+        recurse: true
+        file_type: file
+      register: php2shell_found
+
+    # Merges three sources into one de-duplicated list, php2shell_paths:
+    #   - files from the disk search
+    #   - executables of running PHP processes (with a trailing " (deleted)" stripped)
+    #   - libphp*.so paths seen in Apache's memory maps
+    - name: Combine on-disk and in-use PHP files
+      ansible.builtin.set_fact:
+        php2shell_paths: >-
+          {%- set p = php2shell_found.files | map(attribute='path') | list -%}
+          {%- for r in php2shell_exes.results | default([]) if r.stdout | default('') -%}
+          {%- set _ = p.append(r.stdout | replace(' (deleted)', '')) -%}
+          {%- endfor -%}
+          {%- for r in php2shell_maps.results | default([]) -%}
+          {%- for line in r.stdout_lines | default([]) if line is search('libphp') -%}
+          {%- set _ = p.append(line | regex_search('/[^ ]*libphp[^ ]*[.]so')) -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ p | select | unique | list }}
+
+    # Asks the package manager who owns each path:
+    #   Debian/Ubuntu: dpkg -S <path>            -> "php8.3-cli: /usr/bin/php8.3"
+    #   EL:            rpm -qf --qf '%{NAME}\n'  -> "php-cli"
+    # rc 0 means package-owned; non-zero means not installed by the package manager.
+    - name: Check which of those files belong to a package
+      ansible.builtin.command:
+        argv: >-
+          {{ ['dpkg', '-S', item] if ansible_facts.os_family == 'Debian'
+             else ['rpm', '-qf', '--qf', '%{NAME}\n', item] }}
+      loop: "{{ php2shell_paths }}"
+      register: php2shell_owner
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    # Skipped for files owned by a package already judged above (the `when`), so each PHP is
+    # reported once. For everything else (source builds, tarballs, panel builds, files owned
+    # by a package that php_pkg_re did not match) it reads two strings straight from the file
+    # with grep -a -o, WITHOUT executing it:
+    #   X-Powered-By: PHP/x.y.z      compiled into every PHP SAPI binary and module
+    #   memory_hard_limit_percent    an ini setting that only exists in builds carrying the fix
+    # Wrapper scripts and other non-PHP files named "php" contain neither and are dropped.
+    - name: Read version and patch marker from files not covered by a PHP package
+      vars:
+        owner: "{{ (item.stdout_lines | default([]) | first | default('')).split(':')[0] if item.rc | default(1) == 0 else '' }}"
+      ansible.builtin.command:
+        argv:
+          - grep
+          - -a
+          - -o
+          - -E
+          - 'X-Powered-By: PHP/[0-9]+[.][0-9]+[.][0-9]+|memory_hard_limit_percent'
+          - "{{ item.item }}"
+      loop: "{{ php2shell_owner.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: owner not in (php2shell_pkgs | map(attribute='name') | list)
+      register: php2shell_bininfo
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    # ---------- verdict ----------
+    # Pure Jinja. Turns everything gathered so far into three facts.
+    #
+    # php2shell_findings: one row per PHP package or unpackaged binary with a status and reason.
+    #  Packages, first rule that matches:
+    #    by_version                         FIXED
+    #    below_range                        NOT_AFFECTED
+    #    meets a fixed_builds target        FIXED         (rpm_hit, or dpkg compare rc 0)
+    #    CVE found in changelog             FIXED
+    #    third-party, no applicable row     UNVERIFIED
+    #    has targets but meets none         VULNERABLE
+    #    anything else                      VULNERABLE
+    #  Unpackaged binaries, first rule that matches:
+    #    upstream version >= fixed release  FIXED
+    #    older than first_affected          NOT_AFFECTED
+    #    path matches attested_patched_paths FIXED
+    #    fix marker present in the file     FIXED         (strong hint, 8.2+ builds)
+    #    branch 8.2-8.5, below fixed        VULNERABLE
+    #    older branch (5.4-8.1)             UNVERIFIED    (a source backport is invisible)
+    #
+    # php2shell_sapi:  which web-facing PHP SAPIs are running (php-fpm, php-cgi, lsphp,
+    #                  frankenphp from process names; mod_php from Apache's memory maps).
+    # php2shell_stale: true if any inspected process still maps a deleted PHP file.
+    - name: Build findings
+      ansible.builtin.set_fact:
+        php2shell_findings: >-
+          {%- set out = [] -%}
+          {%- set backport = {} -%}
+          {%- for r in php2shell_changelog.results | default([]) -%}
+          {%- set _ = backport.update({r.item.name: (r.stdout | default('')) is search(cve_re)}) -%}
+          {%- endfor -%}
+          {%- set deb_hit = {} -%}
+          {%- for r in php2shell_debcmp.results | default([]) if r.rc | default(1) == 0 -%}
+          {%- set _ = deb_hit.update({r.item.0.name: r.item.1}) -%}
+          {%- endfor -%}
+          {%- for p in php2shell_pkgs -%}
+          {%- set hit = p.rpm_hit or deb_hit[p.name] | default('') -%}
+          {%- if p.by_version -%}
+          {%- set st = 'FIXED' -%}{%- set why = 'upstream version at or above fixed release' -%}
+          {%- elif p.below_range -%}
+          {%- set st = 'NOT_AFFECTED' -%}{%- set why = 'older than ' ~ first_affected ~ ', outside the reported affected range (still end-of-life)' -%}
+          {%- elif hit -%}
+          {%- set st = 'FIXED' -%}{%- set why = 'at or above vendor fixed build ' ~ hit -%}
+          {%- elif backport[p.name] | default(false) -%}
+          {%- set st = 'FIXED' -%}{%- set why = 'CVE named in package changelog' -%}
+          {%- elif p.third_party and not p.targets -%}
+          {%- set st = 'UNVERIFIED' -%}{%- set why = 'third-party build with no fixed_builds row for this OS and branch; check the repo advisory and add a row' -%}
+          {%- elif p.targets -%}
+          {%- set st = 'VULNERABLE' -%}{%- set why = 'older than known fixed build(s): ' ~ p.targets | join(' / ') -%}
+          {%- else -%}
+          {%- set st = 'VULNERABLE' -%}{%- set why = 'below fixed upstream release; no fixed build listed for this OS and branch' -%}
+          {%- endif -%}
+          {%- set _ = out.append({'status': st, 'source': 'package', 'item': p.name, 'version': p.version, 'reason': why}) -%}
+          {%- endfor -%}
+          {%- for r in php2shell_bininfo.results | default([]) if r.stdout | default('') -%}
+          {%- set path = r.item.item -%}
+          {%- set up = r.stdout_lines | select('match', 'X-Powered-By') | first | default('') | regex_search(version_re) -%}
+          {%- if up -%}
+          {%- set branch = up.split('.')[:2] | join('.') -%}
+          {%- set attested = [] -%}
+          {%- for a in attested_patched_paths if path is search(a) -%}{%- set _ = attested.append(a) -%}{%- endfor -%}
+          {%- if (branch in fixed_releases and up is version(fixed_releases[branch], '>=')) or up is version('8.6.0', '>=') -%}
+          {%- set st = 'FIXED' -%}{%- set why = 'upstream version at or above fixed release' -%}
+          {%- elif up is version(first_affected, '<') -%}
+          {%- set st = 'NOT_AFFECTED' -%}{%- set why = 'older than ' ~ first_affected ~ ', outside the reported affected range (still end-of-life)' -%}
+          {%- elif attested -%}
+          {%- set st = 'FIXED' -%}{%- set why = 'listed in attested_patched_paths' -%}
+          {%- elif 'memory_hard_limit_percent' in r.stdout -%}
+          {%- set st = 'FIXED' -%}{%- set why = 'fix marker memory_hard_limit_percent present in the binary (strong hint)' -%}
+          {%- elif branch in fixed_releases -%}
+          {%- set st = 'VULNERABLE' -%}{%- set why = 'below fixed upstream release ' ~ fixed_releases[branch] ~ ' and no fix marker in the binary' -%}
+          {%- else -%}
+          {%- set st = 'UNVERIFIED' -%}{%- set why = 'end-of-life branch built outside the package manager; a source backport cannot be seen from the binary. Vulnerable unless you patched it: confirm, then list it in attested_patched_paths' -%}
+          {%- endif -%}
+          {%- set _ = out.append({'status': st, 'source': 'unpackaged', 'item': path, 'version': up, 'reason': why}) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+        php2shell_sapi: >-
+          {%- set s = [] -%}
+          {%- for n in ['php-fpm', 'php-cgi', 'lsphp', 'frankenphp'] if php2shell_procs.stdout is search(n) -%}
+          {%- set _ = s.append(n) -%}
+          {%- endfor -%}
+          {%- for r in php2shell_maps.results | default([])
+              if (r.stdout | default('')) is search('libphp') and 'mod_php' not in s -%}
+          {%- set _ = s.append('mod_php') -%}
+          {%- endfor -%}
+          {{ s | join('+') if s else 'none' }}
+        php2shell_stale: >-
+          {{ php2shell_maps.results | default([]) | map(attribute='stdout', default='')
+             | select('search', '[(]deleted[)]') | list | length > 0 }}
+
+    # Collapses the findings into one value per host, worst first:
+    #   NOT_INSTALLED   no PHP found
+    #   VULNERABLE      at least one finding is VULNERABLE
+    #   UNVERIFIED      none vulnerable, but at least one could not be confirmed
+    #   RESTART_NEEDED  everything on disk is fine, but a running process predates the update
+    #   FIXED           everything is FIXED or NOT_AFFECTED
+    - name: Set the overall result
+      vars:
+        statuses: "{{ php2shell_findings | map(attribute='status') | list }}"
+      ansible.builtin.set_fact:
+        php2shell_result: >-
+          {{ 'NOT_INSTALLED' if statuses | length == 0
+             else 'VULNERABLE' if 'VULNERABLE' in statuses
+             else 'UNVERIFIED' if 'UNVERIFIED' in statuses
+             else 'RESTART_NEEDED' if php2shell_stale | bool
+             else 'FIXED' }}
+
+    # Prints the result and the findings list in the play output for each host.
+    - name: Show per-host findings
+      ansible.builtin.debug:
+        msg:
+          - "Result: {{ php2shell_result }} (running web SAPIs: {{ php2shell_sapi }})"
+          - "{{ php2shell_findings }}"
+
+    # Runs once, on the control node, without sudo. Loops over every host in the play
+    # (including ones that failed or were unreachable, which have no result fact) and writes
+    # one CSV row per finding to report_file. The template reads each host's facts through
+    # hostvars, which is why the earlier tasks store their results with set_fact.
+    - name: Write the CSV report on the control node
+      ansible.builtin.copy:
+        dest: "{{ report_file }}"
+        mode: "0644"
+        content: |
+          host,os,result,web_sapi,status,source,package_or_path,version,reason
+          {% for h in ansible_play_hosts_all | sort %}
+          {% set hv = hostvars[h] %}
+          {% set os = (hv.ansible_facts.distribution | default('')) ~ ' ' ~ (hv.ansible_facts.distribution_version | default('')) %}
+          {% if hv.php2shell_result is not defined %}
+          {{ h }},{{ os }},UNREACHABLE_OR_FAILED,,,,,,
+          {% elif hv.php2shell_findings | length == 0 %}
+          {{ h }},{{ os }},{{ hv.php2shell_result }},{{ hv.php2shell_sapi }},,,,,
+          {% else %}
+          {% for f in hv.php2shell_findings %}
+          {{ h }},{{ os }},{{ hv.php2shell_result }},{{ hv.php2shell_sapi }},{{ f.status }},{{ f.source }},{{ f.item }},{{ f.version }},"{{ f.reason }}"
+          {% endfor %}
+          {% endif %}
+          {% endfor %}
+      delegate_to: localhost
+      run_once: true
+      become: false
+      check_mode: false
+
+    # Marks the host as failed unless the result is FIXED or NOT_INSTALLED, so the PLAY RECAP
+    # and the exit code show which hosts need work. It runs last, after the report is written.
+    # Disable with -e fail_on_vulnerable=false for a report-only run.
+    - name: Fail hosts that need action
+      ansible.builtin.assert:
+        that: php2shell_result in ['FIXED', 'NOT_INSTALLED']
+        fail_msg: >-
+          {{ php2shell_result }}: {{ 'patch PHP, then fully restart php-fpm/Apache'
+          if php2shell_result == 'VULNERABLE'
+          else 'a PHP build could not be confirmed as patched; see the reason in the report'
+          if php2shell_result == 'UNVERIFIED'
+          else 'PHP is patched on disk but running processes predate the update; fully restart php-fpm/Apache' }}
+        quiet: true
+      when: fail_on_vulnerable | bool
